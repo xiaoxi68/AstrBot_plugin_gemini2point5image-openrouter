@@ -13,7 +13,7 @@ class MyPlugin(Star):
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
 
-    @llm_tool(name="pic-gen")
+    @llm_tool(name="gemini-pic-gen")
     async def pic_gen(self, event: AstrMessageEvent, image_description: str) -> str:
         """
             When a user requires image generation or drawing, and asks you to create an image,
