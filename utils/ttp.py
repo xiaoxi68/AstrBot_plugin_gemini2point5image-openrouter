@@ -39,13 +39,13 @@ async def cleanup_old_images():
                     # 如果文件超过15分钟，删除它
                     if file_mtime < cutoff_time:
                         os.remove(file_path)
-                        print(f"🗑️ 已清理过期图像: {file_path}")
+                        print(f"已清理过期图像: {file_path}")
 
                 except Exception as e:
-                    print(f"⚠️ 清理文件 {file_path} 时出错: {e}")
+                    print(f"清理文件 {file_path} 时出错: {e}")
 
     except Exception as e:
-        print(f"⚠️ 图像清理过程出错: {e}")
+        print(f"图像清理过程出错: {e}")
 
 async def save_base64_image(base64_string, image_format="png"):
     """
@@ -88,12 +88,12 @@ async def save_base64_image(base64_string, image_format="png"):
         _last_saved_image = {"url": file_url, "path": image_path}
 
         print(f"✅ 图像已保存到: {abs_path}")
-        print(f"📁 文件大小: {len(image_data)} bytes")
+        print(f"文件大小: {len(image_data)} bytes")
 
         return True
 
     except Exception as decode_error:
-        print(f"❌ Base64 解码/保存失败: {decode_error}")
+        print(f"Base64 解码/保存失败: {decode_error}")
         return False
 
 async def get_saved_image_info():
@@ -106,7 +106,7 @@ async def get_saved_image_info():
     global _last_saved_image
     return _last_saved_image["url"], _last_saved_image["path"]
 
-async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000):
+async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000, input_images=None):
     """
     Generate image using OpenRouter API with Gemini model
 
@@ -115,19 +115,44 @@ async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-fl
         api_key (str): OpenRouter API key
         model (str): Model to use (default: google/gemini-2.5-flash-image-preview:free)
         max_tokens (int): Maximum tokens for the response
+        input_images (list): List of base64 encoded input images (optional)
 
     Returns:
         tuple: (image_url, image_path) or (None, None) if failed
     """
     url = "https://openrouter.ai/api/v1/chat/completions"
 
-    # 为 Gemini 图像生成使用简单的文本消息格式
+    # 构建消息内容，支持输入图片
+    message_content = []
+    
+    # 添加文本内容
+    message_content.append({
+        "type": "text",
+        "text": f"Generate an image: {prompt}"
+    })
+    
+    # 如果有输入图片，添加到消息中
+    if input_images:
+        for base64_image in input_images:
+            # 确保base64数据包含正确的data URI格式
+            if not base64_image.startswith('data:image/'):
+                # 假设是PNG格式，添加data URI前缀
+                base64_image = f"data:image/png;base64,{base64_image}"
+            
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": base64_image
+                }
+            })
+
+    # 为 Gemini 图像生成构建payload
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "user",
-                "content": f"Generate an image: {prompt}"
+                "content": message_content if len(message_content) > 1 else f"Generate an image: {prompt}"
             }
         ],
         "max_tokens": max_tokens,
@@ -141,10 +166,24 @@ async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-fl
         "X-Title": "AstrBot LLM Draw Plus"
     }
 
+    # 调试输出：打印请求结构
+    print(f"\n调试信息:")
+    print(f"模型: {model}")
+    print(f"输入图片数量: {len(input_images) if input_images else 0}")
+    if input_images:
+        print(f"第一张图片base64长度: {len(input_images[0])}")
+    print(f"消息内容结构: {type(payload['messages'][0]['content'])}")
+    if isinstance(payload['messages'][0]['content'], list):
+        content_types = [item.get('type', 'unknown') for item in payload['messages'][0]['content']]
+        print(f"消息内容类型: {content_types}")
+
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, json=payload, headers=headers) as response:
                 data = await response.json()
+                
+                print(f"API响应状态: {response.status}")
+                print(f"响应数据键: {list(data.keys()) if isinstance(data, dict) else 'Not dict'}")
 
                 if response.status == 200 and "choices" in data:
                     choice = data["choices"][0]
@@ -184,7 +223,7 @@ async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-fl
                             if await save_base64_image(base64_string, image_format):
                                 return await get_saved_image_info()
 
-                    print("⚠️  未找到图像数据")
+                    print("未找到图像数据")
                     return None, None
 
                 else:
@@ -244,26 +283,117 @@ async def generate_image(prompt, api_key, model="stabilityai/stable-diffusion-3-
 
 
 if __name__ == "__main__":
-    async def main():
-        # 简单测试
-        print("测试 OpenRouter Gemini 图像生成...")
-        openrouter_api_key = ""
-        prompt = "一只可爱的红色小熊猫，数字艺术风格"
+    async def create_test_image_base64():
+        """创建一个测试用的小图片的base64数据"""
+        import io
+        from PIL import Image as PILImage, ImageDraw
+        
+        # 创建一个简单的测试图片
+        img = PILImage.new('RGB', (100, 100), color='red')
+        draw = ImageDraw.Draw(img)
+        draw.text((10, 40), "TEST", fill='white')
+        
+        # 转换为base64
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        image_bytes = buffer.getvalue()
+        
+        import base64
+        return base64.b64encode(image_bytes).decode()
 
-        if openrouter_api_key == "your_openrouter_api_key_here":
+    async def main():
+        print("测试 OpenRouter Gemini 图像生成...")
+        openrouter_api_key = "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"  # 请设置你的API密钥
+        
+        if not openrouter_api_key or openrouter_api_key == "":
             print("请先设置真实的 OpenRouter API Key")
             return
 
+        print("\n=== 测试1: 先生成一张图片 ===")
+        initial_prompt = "一只可爱的红色小熊猫，数字艺术风格"
+        
         image_url, image_path = await generate_image_openrouter(
-            prompt,
+            initial_prompt,
             openrouter_api_key,
             model="google/gemini-2.5-flash-image-preview:free"
         )
-
+        
         if image_url and image_path:
-            print("✅ 图像生成成功!")
-            print("文件路径: {image_path}")
+            print("✅ 初始图像生成成功!")
+            print(f"文件路径: {image_path}")
+            
+            print("\n=== 测试2: 使用生成的图片进行修改 ===")
+            try:
+                # 读取刚生成的图片并转换为base64
+                import base64
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                generated_image_base64 = base64.b64encode(image_bytes).decode()
+                
+                print(f"生成图片的base64长度: {len(generated_image_base64)}")
+                
+                # 使用生成的图片进行修改
+                modify_prompt = "将这张图片修改为蓝色主题，并添加一些星星装饰"
+                input_images = [generated_image_base64]
+                
+                print("正在使用生成的图片进行修改...")
+                modified_url, modified_path = await generate_image_openrouter(
+                    modify_prompt,
+                    openrouter_api_key,
+                    model="google/gemini-2.5-flash-image-preview:free",
+                    input_images=input_images
+                )
+                
+                if modified_url and modified_path:
+                    print("✅ 图片修改成功!")
+                    print(f"修改后文件路径: {modified_path}")
+                else:
+                    print("❌ 图片修改失败")
+                    
+            except Exception as e:
+                print(f"❌ 图片修改过程出错: {e}")
         else:
-            print("❌ 图像生成失败")
+            print("❌ 初始图像生成失败，无法进行后续修改测试")
+
+        print("\n=== 测试3: 检查多模态请求格式 ===")
+        # 不实际发送请求，只检查构造的payload格式
+        try:
+            test_image_base64 = await create_test_image_base64()
+            
+            # 模拟构造请求，检查格式
+            message_content = []
+            message_content.append({
+                "type": "text", 
+                "text": f"Generate an image: {initial_prompt}"
+            })
+            
+            base64_image = f"data:image/png;base64,{test_image_base64}"
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": base64_image
+                }
+            })
+            
+            payload = {
+                "model": "google/gemini-2.5-flash-image-preview:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": message_content
+                    }
+                ],
+                "max_tokens": 1000,
+                "temperature": 0.7
+            }
+            
+            print("✅ 多模态请求格式构造成功")
+            print(f"消息内容类型数量: {len(message_content)}")
+            print(f"包含文本: {any(item['type'] == 'text' for item in message_content)}")
+            print(f"包含图片: {any(item['type'] == 'image_url' for item in message_content)}")
+            print(f"图片URL前缀: {message_content[1]['image_url']['url'][:50]}...")
+            
+        except Exception as e:
+            print(f"❌ 请求格式检查出错: {e}")
 
     asyncio.run(main())
