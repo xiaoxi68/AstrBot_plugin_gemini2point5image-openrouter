@@ -303,7 +303,7 @@ if __name__ == "__main__":
 
     async def main():
         print("测试 OpenRouter Gemini 图像生成...")
-        openrouter_api_key = "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"  # 请设置你的API密钥
+        openrouter_api_key = ""  # 请设置你的API密钥
         
         if not openrouter_api_key or openrouter_api_key == "":
             print("请先设置真实的 OpenRouter API Key")
