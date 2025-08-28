@@ -5,7 +5,7 @@ from astrbot.api.all import *
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.0.1")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.2")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
