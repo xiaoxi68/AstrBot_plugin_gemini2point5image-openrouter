@@ -7,11 +7,55 @@ from .utils.file_send_server import send_file
 
 @register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.0.1")
 class MyPlugin(Star):
-    def __init__(self, context: Context,config: dict):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.openrouter_api_key = config.get("openrouter_api_key")
+        # 支持多个API密钥
+        self.openrouter_api_keys = config.get("openrouter_api_keys", [])
+        # 向后兼容：如果还在使用旧的单个API密钥配置
+        old_api_key = config.get("openrouter_api_key")
+        if old_api_key and not self.openrouter_api_keys:
+            self.openrouter_api_keys = [old_api_key]
+        
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
+
+    async def send_image_with_callback_api(self, image_path: str) -> Image:
+        """
+        优先使用callback_api_base发送图片，失败则退回到本地文件发送
+        
+        Args:
+            image_path (str): 图片文件路径
+            
+        Returns:
+            Image: 图片组件
+        """
+        try:
+            # 获取框架配置的callback_api_base
+            callback_api_base = self.context.get_config().get("callback_api_base")
+            
+            if callback_api_base:
+                logger.info(f"检测到配置了callback_api_base: {callback_api_base}")
+                try:
+                    # 创建Image组件并尝试转换为下载链接
+                    image_component = Image.fromFileSystem(image_path)
+                    download_url = await image_component.convert_to_web_link()
+                    
+                    logger.info(f"成功生成下载链接: {download_url}")
+                    # 使用URL形式发送图片
+                    return Image.fromURL(download_url)
+                    
+                except Exception as e:
+                    logger.warning(f"使用callback_api_base生成下载链接失败: {e}，将退回到本地文件发送")
+                    # 如果生成下载链接失败，退回到本地文件发送
+                    return Image.fromFileSystem(image_path)
+            else:
+                logger.info("未配置callback_api_base，使用本地文件发送")
+                return Image.fromFileSystem(image_path)
+                
+        except Exception as e:
+            logger.error(f"发送图片时出错: {e}")
+            # 发生任何错误都退回到本地文件发送
+            return Image.fromFileSystem(image_path)
 
     @llm_tool(name="gemini-pic-gen")
     async def pic_gen(self, event: AstrMessageEvent, image_description: str, use_reference_images: bool = True) -> str:
@@ -27,7 +71,7 @@ class MyPlugin(Star):
             - image_description (string): Description of the image to generate. Translate to English if needed.
             - use_reference_images (bool): Whether to use images from user's message as reference. Default True.
         """
-        openrouter_api_key = self.openrouter_api_key
+        openrouter_api_keys = self.openrouter_api_keys
         nap_server_address = self.nap_server_address
         nap_server_port = self.nap_server_port
 
@@ -54,7 +98,7 @@ class MyPlugin(Star):
         try:
             image_url, image_path = await generate_image_openrouter(
                 image_description, 
-                openrouter_api_key, 
+                openrouter_api_keys, 
                 input_images=input_images
             )
             
@@ -64,12 +108,13 @@ class MyPlugin(Star):
                 yield event.chain_result(error_chain)
                 return
             
-            # 处理文件传输
+            # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
                 image_path = await send_file(image_path, HOST=nap_server_address, PORT=nap_server_port)
             
-            # 返回生成的图像
-            chain = [Image.fromFileSystem(image_path)]
+            # 使用新的发送方法，优先使用callback_api_base
+            image_component = await self.send_image_with_callback_api(image_path)
+            chain = [image_component]
             yield event.chain_result(chain)
                 
         except Exception as e:

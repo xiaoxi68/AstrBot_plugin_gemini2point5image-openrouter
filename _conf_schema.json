@@ -1,9 +1,9 @@
 {
-    "openrouter_api_key": {
-        "description": "OpenRouter API 密钥",
-        "type": "string",
-        "hint": "请前往 https://openrouter.ai/ 注册账号，并获取 OpenRouter API Key",
-        "default": "OpenRouter_API_Key",
+    "openrouter_api_keys": {
+        "description": "OpenRouter API 密钥列表",
+        "type": "list",
+        "hint": "请前往 https://openrouter.ai/ 注册账号，并获取多个 OpenRouter API Key。支持多个密钥自动轮换，当一个密钥额度耗尽时会自动切换到下一个",
+        "default": ["OpenRouter_API_Key_1", "OpenRouter_API_Key_2"],
         "obvious_hint": true
     },
     "nap_server_address": {

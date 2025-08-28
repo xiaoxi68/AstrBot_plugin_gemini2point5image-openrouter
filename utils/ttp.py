@@ -8,8 +8,9 @@ import re
 from datetime import datetime, timedelta
 import glob
 
-# 全局变量存储最后保存的图像信息
+# 全局变量存储最后保存的图像信息和API密钥轮换状态
 _last_saved_image = {"url": None, "path": None}
+_api_key_index = 0  # 当前使用的API密钥索引
 
 async def cleanup_old_images():
     """
@@ -96,6 +97,37 @@ async def save_base64_image(base64_string, image_format="png"):
         print(f"Base64 解码/保存失败: {decode_error}")
         return False
 
+async def get_next_api_key(api_keys):
+    """
+    获取下一个可用的API密钥
+    
+    Args:
+        api_keys (list): API密钥列表
+        
+    Returns:
+        str: 当前可用的API密钥
+    """
+    global _api_key_index
+    
+    if not api_keys or not isinstance(api_keys, list):
+        raise ValueError("API密钥列表不能为空")
+    
+    current_key = api_keys[_api_key_index % len(api_keys)]
+    return current_key
+
+def rotate_to_next_api_key(api_keys):
+    """
+    轮换到下一个API密钥
+    
+    Args:
+        api_keys (list): API密钥列表
+    """
+    global _api_key_index
+    
+    if api_keys and isinstance(api_keys, list) and len(api_keys) > 1:
+        _api_key_index = (_api_key_index + 1) % len(api_keys)
+        print(f"已轮换到下一个API密钥，当前索引: {_api_key_index}")
+
 async def get_saved_image_info():
     """
     获取最后保存的图像信息
@@ -106,13 +138,13 @@ async def get_saved_image_info():
     global _last_saved_image
     return _last_saved_image["url"], _last_saved_image["path"]
 
-async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000, input_images=None):
+async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000, input_images=None):
     """
-    Generate image using OpenRouter API with Gemini model
+    Generate image using OpenRouter API with Gemini model, supports multiple API keys with automatic rotation
 
     Args:
         prompt (str): The prompt for image generation
-        api_key (str): OpenRouter API key
+        api_keys (list): List of OpenRouter API keys for rotation
         model (str): Model to use (default: google/gemini-2.5-flash-image-preview:free)
         max_tokens (int): Maximum tokens for the response
         input_images (list): List of base64 encoded input images (optional)
@@ -120,122 +152,154 @@ async def generate_image_openrouter(prompt, api_key, model="google/gemini-2.5-fl
     Returns:
         tuple: (image_url, image_path) or (None, None) if failed
     """
+    # 兼容性处理：如果传入单个API密钥字符串，转换为列表
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    
+    if not api_keys:
+        print("❌ 未提供API密钥")
+        return None, None
+    
     url = "https://openrouter.ai/api/v1/chat/completions"
-
-    # 构建消息内容，支持输入图片
-    message_content = []
     
-    # 添加文本内容
-    message_content.append({
-        "type": "text",
-        "text": f"Generate an image: {prompt}"
-    })
+    # 尝试每个API密钥，直到成功或全部失败
+    max_attempts = len(api_keys)
     
-    # 如果有输入图片，添加到消息中
-    if input_images:
-        for base64_image in input_images:
-            # 确保base64数据包含正确的data URI格式
-            if not base64_image.startswith('data:image/'):
-                # 假设是PNG格式，添加data URI前缀
-                base64_image = f"data:image/png;base64,{base64_image}"
-            
-            message_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": base64_image
-                }
-            })
-
-    # 为 Gemini 图像生成构建payload
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": message_content if len(message_content) > 1 else f"Generate an image: {prompt}"
-            }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.7
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/astrbot",
-        "X-Title": "AstrBot LLM Draw Plus"
-    }
-
-    # 调试输出：打印请求结构
-    print(f"\n调试信息:")
-    print(f"模型: {model}")
-    print(f"输入图片数量: {len(input_images) if input_images else 0}")
-    if input_images:
-        print(f"第一张图片base64长度: {len(input_images[0])}")
-    print(f"消息内容结构: {type(payload['messages'][0]['content'])}")
-    if isinstance(payload['messages'][0]['content'], list):
-        content_types = [item.get('type', 'unknown') for item in payload['messages'][0]['content']]
-        print(f"消息内容类型: {content_types}")
-
-    async with aiohttp.ClientSession() as session:
+    for attempt in range(max_attempts):
         try:
-            async with session.post(url, json=payload, headers=headers) as response:
-                data = await response.json()
-                
-                print(f"API响应状态: {response.status}")
-                print(f"响应数据键: {list(data.keys()) if isinstance(data, dict) else 'Not dict'}")
+            current_api_key = await get_next_api_key(api_keys)
+            print(f"尝试使用API密钥 #{(_api_key_index % len(api_keys)) + 1}")
+            
+            # 构建消息内容，支持输入图片
+            message_content = []
+            
+            # 添加文本内容
+            message_content.append({
+                "type": "text",
+                "text": f"Generate an image: {prompt}"
+            })
+            
+            # 如果有输入图片，添加到消息中
+            if input_images:
+                for base64_image in input_images:
+                    # 确保base64数据包含正确的data URI格式
+                    if not base64_image.startswith('data:image/'):
+                        # 假设是PNG格式，添加data URI前缀
+                        base64_image = f"data:image/png;base64,{base64_image}"
+                    
+                    message_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": base64_image
+                        }
+                    })
 
-                if response.status == 200 and "choices" in data:
-                    choice = data["choices"][0]
-                    message = choice["message"]
-                    content = message["content"]
+            # 为 Gemini 图像生成构建payload
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": message_content if len(message_content) > 1 else f"Generate an image: {prompt}"
+                    }
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.7
+            }
 
-                    # 检查 Gemini 标准的 message.images 字段
-                    if "images" in message and message["images"]:
-                        print(f"Gemini 返回了 {len(message['images'])} 个图像")
+            headers = {
+                "Authorization": f"Bearer {current_api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/astrbot",
+                "X-Title": "AstrBot LLM Draw Plus"
+            }
 
-                        for i, image_item in enumerate(message["images"]):
-                            if "image_url" in image_item and "url" in image_item["image_url"]:
-                                image_url = image_item["image_url"]["url"]
+            # 调试输出：打印请求结构
+            print(f"\n调试信息:")
+            print(f"模型: {model}")
+            print(f"输入图片数量: {len(input_images) if input_images else 0}")
+            if input_images:
+                print(f"第一张图片base64长度: {len(input_images[0])}")
+            print(f"消息内容结构: {type(payload['messages'][0]['content'])}")
+            if isinstance(payload['messages'][0]['content'], list):
+                content_types = [item.get('type', 'unknown') for item in payload['messages'][0]['content']]
+                print(f"消息内容类型: {content_types}")
 
-                                # 检查是否是 base64 格式
-                                if image_url.startswith("data:image/"):
-                                    try:
-                                        # 解析 data URI: data:image/png;base64,iVBORw0KGg...
-                                        header, base64_data = image_url.split(",", 1)
-                                        image_format = header.split("/")[1].split(";")[0]
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    data = await response.json()
+                    
+                    print(f"API响应状态: {response.status}")
+                    print(f"响应数据键: {list(data.keys()) if isinstance(data, dict) else 'Not dict'}")
 
-                                        if await save_base64_image(base64_data, image_format):
-                                            return await get_saved_image_info()
+                    if response.status == 200 and "choices" in data:
+                        choice = data["choices"][0]
+                        message = choice["message"]
+                        content = message["content"]
 
-                                    except Exception as e:
-                                        print(f"解析图像 {i+1} 失败: {e}")
-                                        continue
+                        # 检查 Gemini 标准的 message.images 字段
+                        if "images" in message and message["images"]:
+                            print(f"✅ Gemini 返回了 {len(message['images'])} 个图像")
 
-                    # 如果没有找到标准images字段，尝试在content中查找
-                    elif isinstance(content, str):
-                        # 查找内联的 base64 图像数据
-                        base64_pattern = r"data:image/([^;]+);base64,([A-Za-z0-9+/=]+)"
-                        matches = re.findall(base64_pattern, content)
+                            for i, image_item in enumerate(message["images"]):
+                                if "image_url" in image_item and "url" in image_item["image_url"]:
+                                    image_url = image_item["image_url"]["url"]
 
-                        if matches:
-                            image_format, base64_string = matches[0]
-                            if await save_base64_image(base64_string, image_format):
-                                return await get_saved_image_info()
+                                    # 检查是否是 base64 格式
+                                    if image_url.startswith("data:image/"):
+                                        try:
+                                            # 解析 data URI: data:image/png;base64,iVBORw0KGg...
+                                            header, base64_data = image_url.split(",", 1)
+                                            image_format = header.split("/")[1].split(";")[0]
 
-                    print("未找到图像数据")
-                    return None, None
+                                            if await save_base64_image(base64_data, image_format):
+                                                return await get_saved_image_info()
 
-                else:
-                    error_msg = data.get("error", {}).get("message", f"HTTP {response.status}")
-                    print(f"❌ OpenRouter API 错误: {error_msg}")
-                    if "error" in data:
-                        print(f"完整错误信息: {data['error']}")
-                    return None, None
+                                        except Exception as e:
+                                            print(f"解析图像 {i+1} 失败: {e}")
+                                            continue
+
+                        # 如果没有找到标准images字段，尝试在content中查找
+                        elif isinstance(content, str):
+                            # 查找内联的 base64 图像数据
+                            base64_pattern = r"data:image/([^;]+);base64,([A-Za-z0-9+/=]+)"
+                            matches = re.findall(base64_pattern, content)
+
+                            if matches:
+                                image_format, base64_string = matches[0]
+                                if await save_base64_image(base64_string, image_format):
+                                    return await get_saved_image_info()
+
+                        print("✅ API调用成功，但未找到图像数据")
+                        return None, None
+
+                    elif response.status == 429 or (response.status == 402 and "insufficient" in str(data).lower()):
+                        # 额度耗尽或速率限制，尝试下一个密钥
+                        error_msg = data.get("error", {}).get("message", f"HTTP {response.status}")
+                        print(f"⚠️ API密钥 #{(_api_key_index % len(api_keys)) + 1} 额度耗尽或速率限制: {error_msg}")
+                        
+                        if attempt < max_attempts - 1:  # 如果还有其他密钥可以尝试
+                            rotate_to_next_api_key(api_keys)
+                            continue
+                        else:
+                            print("❌ 所有API密钥都已达到限制")
+                            return None, None
+                    else:
+                        error_msg = data.get("error", {}).get("message", f"HTTP {response.status}")
+                        print(f"❌ OpenRouter API 错误: {error_msg}")
+                        if "error" in data:
+                            print(f"完整错误信息: {data['error']}")
+                        return None, None
 
         except Exception as e:
-            print(f"❌ 调用 OpenRouter API 时发生异常: {str(e)}")
-            return None, None
+            print(f"❌ 调用 OpenRouter API 时发生异常 (密钥 #{(_api_key_index % len(api_keys)) + 1}): {str(e)}")
+            if attempt < max_attempts - 1:
+                rotate_to_next_api_key(api_keys)
+                continue
+            else:
+                return None, None
+    
+    return None, None
 
 async def generate_image(prompt, api_key, model="stabilityai/stable-diffusion-3-5-large", seed=None, image_size="1024x1024"):
     url = "https://api.siliconflow.cn/v1/images/generations"
