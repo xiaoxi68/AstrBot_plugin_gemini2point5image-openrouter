@@ -2,10 +2,11 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.all import *
+from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.2")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.3")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -58,7 +59,7 @@ class MyPlugin(Star):
             return Image.fromFileSystem(image_path)
 
     @llm_tool(name="gemini-pic-gen")
-    async def pic_gen(self, event: AstrMessageEvent, image_description: str, use_reference_images: bool = True) -> str:
+    async def pic_gen(self, event: AstrMessageEvent, image_description: str, use_reference_images: bool = True):
         """
             Generate or modify images using Gemini model via OpenRouter API.
             
@@ -86,7 +87,18 @@ class MyPlugin(Star):
                             base64_data = await comp.convert_to_base64()
                             input_images.append(base64_data)
                         except Exception as e:
-                            logger.warning(f"转换参考图片到base64失败: {e}")
+                            logger.warning(f"转换当前消息中的参考图片到base64失败: {e}")
+                    elif isinstance(comp, Reply):
+                        # 处理引用消息中的图片
+                        if hasattr(comp, 'chain') and comp.chain:
+                            for reply_comp in comp.chain:
+                                if isinstance(reply_comp, Image):
+                                    try:
+                                        base64_data = await reply_comp.convert_to_base64()
+                                        input_images.append(base64_data)
+                                        logger.info(f"从引用消息中获取到图片")
+                                    except Exception as e:
+                                        logger.warning(f"转换引用消息中的参考图片到base64失败: {e}")
             
             # 记录使用的图片数量
             if input_images:
@@ -116,9 +128,11 @@ class MyPlugin(Star):
             image_component = await self.send_image_with_callback_api(image_path)
             chain = [image_component]
             yield event.chain_result(chain)
+            return
                 
         except Exception as e:
             logger.error(f"图像生成过程出错: {e}")
             # 发送错误消息
             error_chain = [Plain(f"图像生成失败: {str(e)}")]
             yield event.chain_result(error_chain)
+            return
