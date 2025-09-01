@@ -5,23 +5,67 @@ import aiofiles
 import base64
 import os
 import re
+import uuid
 from datetime import datetime, timedelta
 import glob
+from pathlib import Path
+from astrbot.api import logger
+from astrbot.api.star import StarTools
 
-# 全局变量存储最后保存的图像信息和API密钥轮换状态
-_last_saved_image = {"url": None, "path": None}
-_api_key_index = 0  # 当前使用的API密钥索引
 
-async def cleanup_old_images():
+class ImageGeneratorState:
+    """图像生成器状态管理类，用于处理并发安全"""
+    def __init__(self):
+        self.last_saved_image = {"url": None, "path": None}
+        self.api_key_index = 0
+        self._lock = asyncio.Lock()
+    
+    async def get_next_api_key(self, api_keys):
+        """获取下一个可用的API密钥"""
+        async with self._lock:
+            if not api_keys or not isinstance(api_keys, list):
+                raise ValueError("API密钥列表不能为空")
+            current_key = api_keys[self.api_key_index % len(api_keys)]
+            return current_key
+    
+    async def rotate_to_next_api_key(self, api_keys):
+        """轮换到下一个API密钥"""
+        async with self._lock:
+            if api_keys and isinstance(api_keys, list) and len(api_keys) > 1:
+                self.api_key_index = (self.api_key_index + 1) % len(api_keys)
+                logger.info(f"已轮换到下一个API密钥，当前索引: {self.api_key_index}")
+    
+    async def update_saved_image(self, url, path):
+        """更新保存的图像信息"""
+        async with self._lock:
+            self.last_saved_image = {"url": url, "path": path}
+    
+    async def get_saved_image_info(self):
+        """获取最后保存的图像信息"""
+        async with self._lock:
+            return self.last_saved_image["url"], self.last_saved_image["path"]
+
+
+# 全局状态管理实例
+_state = ImageGeneratorState()
+
+
+async def cleanup_old_images(data_dir=None):
     """
     清理超过15分钟的图像文件
+    
+    Args:
+        data_dir (Path): 数据目录路径，如果为None则使用当前脚本目录
     """
     try:
-        # 获取当前脚本所在目录的上级目录（插件根目录）
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        images_dir = os.path.join(script_dir, "images")
+        # 如果没有传入data_dir，使用当前脚本目录
+        if data_dir is None:
+            script_dir = Path(__file__).parent.parent
+            data_dir = script_dir
+        
+        images_dir = data_dir / "images"
 
-        if not os.path.exists(images_dir):
+        if not images_dir.exists():
             return
 
         current_time = datetime.now()
@@ -31,71 +75,79 @@ async def cleanup_old_images():
         image_patterns = ["gemini_image_*.png", "gemini_image_*.jpg", "gemini_image_*.jpeg"]
 
         for pattern in image_patterns:
-            full_pattern = os.path.join(images_dir, pattern)
-            for file_path in glob.glob(full_pattern):
+            for file_path in images_dir.glob(pattern):
                 try:
                     # 获取文件的修改时间
-                    file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
 
                     # 如果文件超过15分钟，删除它
                     if file_mtime < cutoff_time:
-                        os.remove(file_path)
-                        print(f"已清理过期图像: {file_path}")
+                        file_path.unlink()
+                        logger.info(f"已清理过期图像: {file_path}")
 
                 except Exception as e:
-                    print(f"清理文件 {file_path} 时出错: {e}")
+                    logger.warning(f"清理文件 {file_path} 时出错: {e}")
 
     except Exception as e:
-        print(f"图像清理过程出错: {e}")
+        logger.error(f"图像清理过程出错: {e}")
 
-async def save_base64_image(base64_string, image_format="png"):
+
+async def save_base64_image(base64_string, image_format="png", data_dir=None):
     """
     保存base64图像数据到images文件夹
 
     Args:
         base64_string (str): base64编码的图像数据
         image_format (str): 图像格式
+        data_dir (Path): 数据目录路径，如果为None则使用当前脚本目录
 
     Returns:
         bool: 是否保存成功
     """
-    global _last_saved_image
     try:
-        # 获取当前脚本所在目录的上级目录（插件根目录）
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        images_dir = os.path.join(script_dir, "images")
+        # 如果没有传入data_dir，使用当前脚本目录
+        if data_dir is None:
+            script_dir = Path(__file__).parent.parent
+            data_dir = script_dir
+        
+        images_dir = data_dir / "images"
         # 确保images目录存在
-        if not os.path.exists(images_dir):
-            os.makedirs(images_dir)
+        images_dir.mkdir(exist_ok=True)
+        
         # 先清理旧图像
-        await cleanup_old_images()
+        await cleanup_old_images(data_dir)
 
         # 解码 base64 数据
         image_data = base64.b64decode(base64_string)
 
-        # 生成文件名（使用时间戳避免冲突）
+        # 生成唯一文件名（使用时间戳和UUID避免冲突）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        image_path = os.path.join(images_dir, f"gemini_image_{timestamp}.{image_format}")
+        unique_id = str(uuid.uuid4())[:8]
+        image_path = images_dir / f"gemini_image_{timestamp}_{unique_id}.{image_format}"
 
         # 保存图像文件
         async with aiofiles.open(image_path, "wb") as f:
             await f.write(image_data)
 
         # 获取绝对路径
-        abs_path = os.path.abspath(image_path)
+        abs_path = str(image_path.absolute())
         file_url = f"file://{abs_path}"
 
-        # 存储信息
-        _last_saved_image = {"url": file_url, "path": image_path}
+        # 更新状态
+        await _state.update_saved_image(file_url, str(image_path))
 
-        print(f"✅ 图像已保存到: {abs_path}")
-        print(f"文件大小: {len(image_data)} bytes")
+        logger.info(f"图像已保存到: {abs_path}")
+        logger.debug(f"文件大小: {len(image_data)} bytes")
 
         return True
 
-    except Exception as decode_error:
-        print(f"Base64 解码/保存失败: {decode_error}")
+    except base64.binascii.Error as e:
+        logger.error(f"Base64 解码失败: {e}")
         return False
+    except Exception as e:
+        logger.error(f"保存图像文件失败: {e}")
+        return False
+
 
 async def get_next_api_key(api_keys):
     """
@@ -107,26 +159,18 @@ async def get_next_api_key(api_keys):
     Returns:
         str: 当前可用的API密钥
     """
-    global _api_key_index
-    
-    if not api_keys or not isinstance(api_keys, list):
-        raise ValueError("API密钥列表不能为空")
-    
-    current_key = api_keys[_api_key_index % len(api_keys)]
-    return current_key
+    return await _state.get_next_api_key(api_keys)
 
-def rotate_to_next_api_key(api_keys):
+
+async def rotate_to_next_api_key(api_keys):
     """
     轮换到下一个API密钥
     
     Args:
         api_keys (list): API密钥列表
     """
-    global _api_key_index
-    
-    if api_keys and isinstance(api_keys, list) and len(api_keys) > 1:
-        _api_key_index = (_api_key_index + 1) % len(api_keys)
-        print(f"已轮换到下一个API密钥，当前索引: {_api_key_index}")
+    await _state.rotate_to_next_api_key(api_keys)
+
 
 async def get_saved_image_info():
     """
@@ -135,10 +179,10 @@ async def get_saved_image_info():
     Returns:
         tuple: (image_url, image_path)
     """
-    global _last_saved_image
-    return _last_saved_image["url"], _last_saved_image["path"]
+    return await _state.get_saved_image_info()
 
-async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000, input_images=None):
+
+async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-flash-image-preview:free", max_tokens=1000, input_images=None, api_base=None):
     """
     Generate image using OpenRouter API with Gemini model, supports multiple API keys with automatic rotation
 
@@ -148,6 +192,7 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
         model (str): Model to use (default: google/gemini-2.5-flash-image-preview:free)
         max_tokens (int): Maximum tokens for the response
         input_images (list): List of base64 encoded input images (optional)
+        api_base (str): Custom API base URL (optional, defaults to OpenRouter)
 
     Returns:
         tuple: (image_url, image_path) or (None, None) if failed
@@ -157,10 +202,14 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
         api_keys = [api_keys]
     
     if not api_keys:
-        print("❌ 未提供API密钥")
+        logger.error("未提供API密钥")
         return None, None
     
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    # 支持自定义API base
+    if api_base:
+        url = f"{api_base.rstrip('/')}/v1/chat/completions"
+    else:
+        url = "https://openrouter.ai/api/v1/chat/completions"
     
     # 尝试每个API密钥，直到成功或全部失败
     max_attempts = len(api_keys)
@@ -168,7 +217,8 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
     for attempt in range(max_attempts):
         try:
             current_api_key = await get_next_api_key(api_keys)
-            print(f"尝试使用API密钥 #{(_api_key_index % len(api_keys)) + 1}")
+            current_index = (_state.api_key_index % len(api_keys)) + 1
+            logger.info(f"尝试使用API密钥 #{current_index}")
             
             # 构建消息内容，支持输入图片
             message_content = []
@@ -215,22 +265,22 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
             }
 
             # 调试输出：打印请求结构
-            print(f"\n调试信息:")
-            print(f"模型: {model}")
-            print(f"输入图片数量: {len(input_images) if input_images else 0}")
+            logger.debug(f"模型: {model}")
+            logger.debug(f"输入图片数量: {len(input_images) if input_images else 0}")
             if input_images:
-                print(f"第一张图片base64长度: {len(input_images[0])}")
-            print(f"消息内容结构: {type(payload['messages'][0]['content'])}")
+                logger.debug(f"第一张图片base64长度: {len(input_images[0])}")
+            logger.debug(f"消息内容结构: {type(payload['messages'][0]['content'])}")
             if isinstance(payload['messages'][0]['content'], list):
                 content_types = [item.get('type', 'unknown') for item in payload['messages'][0]['content']]
-                print(f"消息内容类型: {content_types}")
+                logger.debug(f"消息内容类型: {content_types}")
 
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     data = await response.json()
                     
-                    print(f"API响应状态: {response.status}")
-                    print(f"响应数据键: {list(data.keys()) if isinstance(data, dict) else 'Not dict'}")
+                    logger.debug(f"API响应状态: {response.status}")
+                    logger.debug(f"响应数据键: {list(data.keys()) if isinstance(data, dict) else 'Not dict'}")
 
                     if response.status == 200 and "choices" in data:
                         choice = data["choices"][0]
@@ -239,7 +289,7 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
 
                         # 检查 Gemini 标准的 message.images 字段
                         if "images" in message and message["images"]:
-                            print(f"✅ Gemini 返回了 {len(message['images'])} 个图像")
+                            logger.info(f"Gemini 返回了 {len(message['images'])} 个图像")
 
                             for i, image_item in enumerate(message["images"]):
                                 if "image_url" in image_item and "url" in image_item["image_url"]:
@@ -256,7 +306,7 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
                                                 return await get_saved_image_info()
 
                                         except Exception as e:
-                                            print(f"解析图像 {i+1} 失败: {e}")
+                                            logger.warning(f"解析图像 {i+1} 失败: {e}")
                                             continue
 
                         # 如果没有找到标准images字段，尝试在content中查找
@@ -270,38 +320,59 @@ async def generate_image_openrouter(prompt, api_keys, model="google/gemini-2.5-f
                                 if await save_base64_image(base64_string, image_format):
                                     return await get_saved_image_info()
 
-                        print("✅ API调用成功，但未找到图像数据")
+                        logger.info("API调用成功，但未找到图像数据")
                         return None, None
 
                     elif response.status == 429 or (response.status == 402 and "insufficient" in str(data).lower()):
                         # 额度耗尽或速率限制，尝试下一个密钥
                         error_msg = data.get("error", {}).get("message", f"HTTP {response.status}")
-                        print(f"⚠️ API密钥 #{(_api_key_index % len(api_keys)) + 1} 额度耗尽或速率限制: {error_msg}")
+                        logger.warning(f"API密钥 #{current_index} 额度耗尽或速率限制: {error_msg}")
                         
                         if attempt < max_attempts - 1:  # 如果还有其他密钥可以尝试
-                            rotate_to_next_api_key(api_keys)
+                            await rotate_to_next_api_key(api_keys)
                             continue
                         else:
-                            print("❌ 所有API密钥都已达到限制")
+                            logger.error("所有API密钥都已达到限制")
                             return None, None
                     else:
                         error_msg = data.get("error", {}).get("message", f"HTTP {response.status}")
-                        print(f"❌ OpenRouter API 错误: {error_msg}")
+                        logger.error(f"OpenRouter API 错误: {error_msg}")
                         if "error" in data:
-                            print(f"完整错误信息: {data['error']}")
+                            logger.debug(f"完整错误信息: {data['error']}")
                         return None, None
 
-        except Exception as e:
-            print(f"❌ 调用 OpenRouter API 时发生异常 (密钥 #{(_api_key_index % len(api_keys)) + 1}): {str(e)}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"网络请求失败 (密钥 #{current_index}): {str(e)}")
             if attempt < max_attempts - 1:
-                rotate_to_next_api_key(api_keys)
+                await rotate_to_next_api_key(api_keys)
+                continue
+            else:
+                return None, None
+        except Exception as e:
+            logger.error(f"调用 OpenRouter API 时发生异常 (密钥 #{current_index}): {str(e)}")
+            if attempt < max_attempts - 1:
+                await rotate_to_next_api_key(api_keys)
                 continue
             else:
                 return None, None
     
     return None, None
 
+
 async def generate_image(prompt, api_key, model="stabilityai/stable-diffusion-3-5-large", seed=None, image_size="1024x1024"):
+    """
+    生成图像使用SiliconFlow API
+    
+    Args:
+        prompt (str): 图像生成提示
+        api_key (str): API密钥
+        model (str): 模型名称
+        seed (int): 随机种子
+        image_size (str): 图像尺寸
+        
+    Returns:
+        tuple: (image_url, image_path) or (None, None) if failed
+    """
     url = "https://api.siliconflow.cn/v1/images/generations"
 
     if seed is None:
@@ -318,32 +389,58 @@ async def generate_image(prompt, api_key, model="stabilityai/stable-diffusion-3-
         "Content-Type": "application/json"
     }
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            async with session.post(url, json=payload, headers=headers) as response:
-                data = await response.json()
+    max_retries = 10  # 最大重试次数
+    retry_count = 0
+    
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while retry_count < max_retries:
+            try:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    data = await response.json()
 
-                if data.get("code") == 50603:
-                    print("System is too busy now. Please try again later.")
-                    await asyncio.sleep(1)
-                    continue
+                    if data.get("code") == 50603:
+                        logger.warning("系统繁忙，1秒后重试")
+                        await asyncio.sleep(1)
+                        retry_count += 1
+                        continue
 
-                if "images" in data:
-                    for image in data["images"]:
-                        image_url = image["url"]
-                        async with session.get(image_url) as img_response:
-                            if img_response.status == 200:
-                                image_path = "downloaded_image.jpeg"
-                                async with aiofiles.open(image_path, "wb") as f:
-                                    await f.write(await img_response.read())
-                                print(f"Image downloaded from {image_url}")
-                                return image_url, image_path
-                            else:
-                                print(f"Failed to download image from {image_url}")
-                                return None, None
+                    if "images" in data:
+                        for image in data["images"]:
+                            image_url = image["url"]
+                            async with session.get(image_url) as img_response:
+                                if img_response.status == 200:
+                                    # 生成唯一文件名
+                                    script_dir = Path(__file__).parent.parent
+                                    images_dir = script_dir / "images"
+                                    images_dir.mkdir(exist_ok=True)
+                                    
+                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    unique_id = str(uuid.uuid4())[:8]
+                                    image_path = images_dir / f"siliconflow_image_{timestamp}_{unique_id}.jpeg"
+                                    
+                                    async with aiofiles.open(image_path, "wb") as f:
+                                        await f.write(await img_response.read())
+                                    
+                                    logger.info(f"图像已下载: {image_url} -> {image_path}")
+                                    return image_url, str(image_path)
+                                else:
+                                    logger.error(f"下载图像失败: {image_url}")
+                                    return None, None
+                    else:
+                        logger.warning("响应中未找到图像")
+                        return None, None
+                        
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"网络请求失败 (重试 {retry_count + 1}/{max_retries}): {e}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(2 ** retry_count)  # 指数退避
                 else:
-                    print("No images found in the response.")
                     return None, None
+                    
+    logger.error(f"达到最大重试次数 ({max_retries})，生成失败")
+    return None, None
 
 
 if __name__ == "__main__":
@@ -362,64 +459,63 @@ if __name__ == "__main__":
         img.save(buffer, format='PNG')
         image_bytes = buffer.getvalue()
         
-        import base64
         return base64.b64encode(image_bytes).decode()
 
     async def main():
-        print("测试 OpenRouter Gemini 图像生成...")
-        openrouter_api_key = ""  # 请设置你的API密钥
+        logger.info("测试 OpenRouter Gemini 图像生成...")
+        # 从环境变量读取API密钥
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
         
-        if not openrouter_api_key or openrouter_api_key == "":
-            print("请先设置真实的 OpenRouter API Key")
+        if not openrouter_api_key:
+            logger.error("请设置环境变量 OPENROUTER_API_KEY")
             return
 
-        print("\n=== 测试1: 先生成一张图片 ===")
+        logger.info("\n=== 测试1: 先生成一张图片 ===")
         initial_prompt = "一只可爱的红色小熊猫，数字艺术风格"
         
         image_url, image_path = await generate_image_openrouter(
             initial_prompt,
-            openrouter_api_key,
+            [openrouter_api_key],
             model="google/gemini-2.5-flash-image-preview:free"
         )
         
         if image_url and image_path:
-            print("✅ 初始图像生成成功!")
-            print(f"文件路径: {image_path}")
+            logger.info("初始图像生成成功!")
+            logger.info(f"文件路径: {image_path}")
             
-            print("\n=== 测试2: 使用生成的图片进行修改 ===")
+            logger.info("\n=== 测试2: 使用生成的图片进行修改 ===")
             try:
                 # 读取刚生成的图片并转换为base64
-                import base64
-                with open(image_path, 'rb') as f:
-                    image_bytes = f.read()
+                async with aiofiles.open(image_path, 'rb') as f:
+                    image_bytes = await f.read()
                 generated_image_base64 = base64.b64encode(image_bytes).decode()
                 
-                print(f"生成图片的base64长度: {len(generated_image_base64)}")
+                logger.info(f"生成图片的base64长度: {len(generated_image_base64)}")
                 
                 # 使用生成的图片进行修改
                 modify_prompt = "将这张图片修改为蓝色主题，并添加一些星星装饰"
                 input_images = [generated_image_base64]
                 
-                print("正在使用生成的图片进行修改...")
+                logger.info("正在使用生成的图片进行修改...")
                 modified_url, modified_path = await generate_image_openrouter(
                     modify_prompt,
-                    openrouter_api_key,
+                    [openrouter_api_key],
                     model="google/gemini-2.5-flash-image-preview:free",
                     input_images=input_images
                 )
                 
                 if modified_url and modified_path:
-                    print("✅ 图片修改成功!")
-                    print(f"修改后文件路径: {modified_path}")
+                    logger.info("图片修改成功!")
+                    logger.info(f"修改后文件路径: {modified_path}")
                 else:
-                    print("❌ 图片修改失败")
+                    logger.error("图片修改失败")
                     
             except Exception as e:
-                print(f"❌ 图片修改过程出错: {e}")
+                logger.error(f"图片修改过程出错: {e}")
         else:
-            print("❌ 初始图像生成失败，无法进行后续修改测试")
+            logger.error("初始图像生成失败，无法进行后续修改测试")
 
-        print("\n=== 测试3: 检查多模态请求格式 ===")
+        logger.info("\n=== 测试3: 检查多模态请求格式 ===")
         # 不实际发送请求，只检查构造的payload格式
         try:
             test_image_base64 = await create_test_image_base64()
@@ -451,13 +547,13 @@ if __name__ == "__main__":
                 "temperature": 0.7
             }
             
-            print("✅ 多模态请求格式构造成功")
-            print(f"消息内容类型数量: {len(message_content)}")
-            print(f"包含文本: {any(item['type'] == 'text' for item in message_content)}")
-            print(f"包含图片: {any(item['type'] == 'image_url' for item in message_content)}")
-            print(f"图片URL前缀: {message_content[1]['image_url']['url'][:50]}...")
+            logger.info("多模态请求格式构造成功")
+            logger.info(f"消息内容类型数量: {len(message_content)}")
+            logger.info(f"包含文本: {any(item['type'] == 'text' for item in message_content)}")
+            logger.info(f"包含图片: {any(item['type'] == 'image_url' for item in message_content)}")
+            logger.info(f"图片URL前缀: {message_content[1]['image_url']['url'][:50]}...")
             
         except Exception as e:
-            print(f"❌ 请求格式检查出错: {e}")
+            logger.error(f"请求格式检查出错: {e}")
 
     asyncio.run(main())

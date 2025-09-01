@@ -6,6 +6,13 @@
         "default": ["OpenRouter_API_Key_1", "OpenRouter_API_Key_2"],
         "obvious_hint": true
     },
+    "custom_api_base": {
+        "description": "自定义 API Base URL（可选）",
+        "type": "string",
+        "hint": "自定义的 API 基础地址，如果不填写则使用默认的 OpenRouter API 地址。例如：https://api.openrouter.ai 或其他兼容的API地址",
+        "default": "",
+        "obvious_hint": false
+    },
     "nap_server_address": {
         "description": "NAP cat 服务地址,若与服务器在同一服务器上请填写localhost",
         "type": "string",

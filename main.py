@@ -17,6 +17,9 @@ class MyPlugin(Star):
         if old_api_key and not self.openrouter_api_keys:
             self.openrouter_api_keys = [old_api_key]
         
+        # 自定义API base支持
+        self.custom_api_base = config.get("custom_api_base", "").strip()
+        
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
 
@@ -30,32 +33,25 @@ class MyPlugin(Star):
         Returns:
             Image: 图片组件
         """
+        callback_api_base = self.context.get_config().get("callback_api_base")
+        if not callback_api_base:
+            logger.info("未配置callback_api_base，使用本地文件发送")
+            return Image.fromFileSystem(image_path)
+
+        logger.info(f"检测到配置了callback_api_base: {callback_api_base}")
         try:
-            # 获取框架配置的callback_api_base
-            callback_api_base = self.context.get_config().get("callback_api_base")
-            
-            if callback_api_base:
-                logger.info(f"检测到配置了callback_api_base: {callback_api_base}")
-                try:
-                    # 创建Image组件并尝试转换为下载链接
-                    image_component = Image.fromFileSystem(image_path)
-                    download_url = await image_component.convert_to_web_link()
-                    
-                    logger.info(f"成功生成下载链接: {download_url}")
-                    # 使用URL形式发送图片
-                    return Image.fromURL(download_url)
-                    
-                except Exception as e:
-                    logger.warning(f"使用callback_api_base生成下载链接失败: {e}，将退回到本地文件发送")
-                    # 如果生成下载链接失败，退回到本地文件发送
-                    return Image.fromFileSystem(image_path)
-            else:
-                logger.info("未配置callback_api_base，使用本地文件发送")
-                return Image.fromFileSystem(image_path)
-                
+            image_component = Image.fromFileSystem(image_path)
+            download_url = await image_component.convert_to_web_link()
+            logger.info(f"成功生成下载链接: {download_url}")
+            return Image.fromURL(download_url)
+        except (IOError, OSError) as e:
+            logger.warning(f"文件操作失败: {e}，将退回到本地文件发送")
+            return Image.fromFileSystem(image_path)
+        except (ConnectionError, TimeoutError) as e:
+            logger.warning(f"网络连接失败: {e}，将退回到本地文件发送")
+            return Image.fromFileSystem(image_path)
         except Exception as e:
-            logger.error(f"发送图片时出错: {e}")
-            # 发生任何错误都退回到本地文件发送
+            logger.error(f"发送图片时出现未预期的错误: {e}，将退回到本地文件发送")
             return Image.fromFileSystem(image_path)
 
     @llm_tool(name="gemini-pic-gen")
@@ -116,19 +112,26 @@ class MyPlugin(Star):
                         try:
                             base64_data = await comp.convert_to_base64()
                             input_images.append(base64_data)
-                        except Exception as e:
+                        except (IOError, ValueError, OSError) as e:
                             logger.warning(f"转换当前消息中的参考图片到base64失败: {e}")
+                        except Exception as e:
+                            logger.error(f"处理当前消息中的图片时出现未预期的错误: {e}")
                     elif isinstance(comp, Reply):
-                        # 处理引用消息中的图片
-                        if hasattr(comp, 'chain') and comp.chain:
+                        # 修复引用消息中的图片获取逻辑
+                        # Reply组件的chain字段包含被引用的消息内容
+                        if comp.chain:
                             for reply_comp in comp.chain:
                                 if isinstance(reply_comp, Image):
                                     try:
                                         base64_data = await reply_comp.convert_to_base64()
                                         input_images.append(base64_data)
                                         logger.info(f"从引用消息中获取到图片")
-                                    except Exception as e:
+                                    except (IOError, ValueError, OSError) as e:
                                         logger.warning(f"转换引用消息中的参考图片到base64失败: {e}")
+                                    except Exception as e:
+                                        logger.error(f"处理引用消息中的图片时出现未预期的错误: {e}")
+                        else:
+                            logger.debug("引用消息的chain为空，无法获取图片内容")
             
             # 记录使用的图片数量
             if input_images:
@@ -141,7 +144,8 @@ class MyPlugin(Star):
             image_url, image_path = await generate_image_openrouter(
                 image_description, 
                 openrouter_api_keys, 
-                input_images=input_images
+                input_images=input_images,
+                api_base=self.custom_api_base if self.custom_api_base else None
             )
             
             if not image_url or not image_path:
@@ -160,9 +164,18 @@ class MyPlugin(Star):
             yield event.chain_result(chain)
             return
                 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"网络连接错误导致图像生成失败: {e}")
+            error_chain = [Plain(f"网络连接错误，图像生成失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+            return
+        except ValueError as e:
+            logger.error(f"参数错误导致图像生成失败: {e}")
+            error_chain = [Plain(f"参数错误，图像生成失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+            return
         except Exception as e:
-            logger.error(f"图像生成过程出错: {e}")
-            # 发送错误消息
+            logger.error(f"图像生成过程出现未预期的错误: {e}")
             error_chain = [Plain(f"图像生成失败: {str(e)}")]
             yield event.chain_result(error_chain)
             return
