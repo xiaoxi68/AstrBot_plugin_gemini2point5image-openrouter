@@ -5,10 +5,203 @@ from astrbot.api.all import *
 from astrbot.core.message.components import Reply, Plain, Image
 from .utils.ttp import generate_image_openrouter
 
+import time
+import threading
+import asyncio
+from functools import wraps
+from collections import defaultdict, deque
+
+
+class RateLimiter:
+    """基于滑动时间窗口的频率限制器，支持并发安全和自动内存清理"""
+    
+    def __init__(self, max_requests=10, time_window=60, cleanup_interval=300):
+        """
+        初始化频率限制器
+        
+        Args:
+            max_requests: 每个时间窗口内的最大请求次数
+            time_window: 时间窗口长度（秒）
+            cleanup_interval: 自动清理间隔（秒）
+        """
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.cleanup_interval = cleanup_interval
+        
+        # 使用字典存储每个群组的请求时间戳队列
+        self.request_records = defaultdict(deque)
+        
+        # 线程锁，确保并发安全
+        self.lock = threading.RLock()
+        
+        # 上次清理时间
+        self.last_cleanup_time = time.time()
+    
+    def _cleanup_expired_records(self):
+        """清理过期的请求记录，防止内存泄漏"""
+        current_time = time.time()
+        
+        # 如果距离上次清理时间未超过清理间隔，则跳过
+        if current_time - self.last_cleanup_time < self.cleanup_interval:
+            return
+        
+        with self.lock:
+            # 遍历所有群组的记录
+            groups_to_remove = []
+            for group_id, timestamps in self.request_records.items():
+                # 移除过期的时间戳
+                while timestamps and current_time - timestamps[0] > self.time_window:
+                    timestamps.popleft()
+                
+                # 如果队列为空，标记该群组记录可以删除
+                if not timestamps:
+                    groups_to_remove.append(group_id)
+            
+            # 删除空的群组记录
+            for group_id in groups_to_remove:
+                del self.request_records[group_id]
+            
+            # 更新上次清理时间
+            self.last_cleanup_time = current_time
+            
+            if groups_to_remove:
+                logger.debug(f"RateLimiter清理了 {len(groups_to_remove)} 个空的群组记录")
+    
+    def check_rate_limit(self, group_id):
+        """
+        检查指定群组是否超过频率限制
+        
+        Args:
+            group_id: 群组ID（私聊使用用户ID）
+            
+        Returns:
+            tuple: (is_allowed, remaining_time)
+                - is_allowed: 是否允许请求
+                - remaining_time: 剩余冷却时间（秒），如果允许请求则为0
+        """
+        current_time = time.time()
+        
+        # 定期清理过期记录
+        self._cleanup_expired_records()
+        
+        with self.lock:
+            timestamps = self.request_records[group_id]
+            
+            # 移除过期的时间戳
+            while timestamps and current_time - timestamps[0] > self.time_window:
+                timestamps.popleft()
+            
+            # 检查是否超过限制
+            if len(timestamps) >= self.max_requests:
+                # 计算剩余冷却时间
+                oldest_timestamp = timestamps[0]
+                remaining_time = int(self.time_window - (current_time - oldest_timestamp)) + 1
+                return False, remaining_time
+            
+            # 记录当前请求时间戳
+            timestamps.append(current_time)
+            return True, 0
+    
+    def update_config(self, max_requests=None, time_window=None, cleanup_interval=None):
+        """动态更新配置"""
+        with self.lock:
+            if max_requests is not None:
+                self.max_requests = max_requests
+            if time_window is not None:
+                self.time_window = time_window
+            if cleanup_interval is not None:
+                self.cleanup_interval = cleanup_interval
+            
+            logger.info(f"RateLimiter配置已更新: max_requests={self.max_requests}, "
+                       f"time_window={self.time_window}, cleanup_interval={self.cleanup_interval}")
+
+
+def rate_limited(rate_limiter_attr='rate_limiter', config_attr='config'):
+    """
+    频率限制装饰器，支持异步生成器函数
+    
+    Args:
+        rate_limiter_attr: RateLimiter实例的属性名
+        config_attr: 配置字典的属性名
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, event: AstrMessageEvent):
+            # 检查是否启用频率限制
+            config = getattr(self, config_attr, {})
+            if not config.get('rate_limit_enabled', True):
+                # 未启用频率限制，直接执行原函数
+                async for result in func(self, event):
+                    yield result
+                return
+            
+            # 获取RateLimiter实例
+            rate_limiter = getattr(self, rate_limiter_attr, None)
+            if rate_limiter is None:
+                logger.warning("RateLimiter实例未初始化，跳过频率限制检查")
+                async for result in func(self, event):
+                    yield result
+                return
+            
+            # 确定群组ID（私聊使用用户ID）
+            try:
+                if hasattr(event, 'group_id') and event.group_id:
+                    group_id = f"group_{event.group_id}"
+                elif hasattr(event, 'user_id') and event.user_id:
+                    group_id = f"user_{event.user_id}"
+                else:
+                    # 无法确定群组ID，记录警告但不阻止请求
+                    logger.warning("无法确定群组ID或用户ID，跳过频率限制检查")
+                    async for result in func(self, event):
+                        yield result
+                    return
+            except Exception as e:
+                logger.error(f"获取群组ID时出错: {e}，跳过频率限制检查")
+                async for result in func(self, event):
+                    yield result
+                return
+            
+            # 执行频率限制检查
+            try:
+                is_allowed, remaining_time = rate_limiter.check_rate_limit(group_id)
+                
+                if not is_allowed:
+                    # 超过频率限制，返回提示消息
+                    message_template = config.get('rate_limit_message',
+                        "⚠️ 图片生成频率限制：当前群组已达到限制（{max_requests}次/{time_window}秒）。请在 {remaining_time} 秒后再试。")
+                    
+                    error_message = message_template.format(
+                        max_requests=rate_limiter.max_requests,
+                        time_window=rate_limiter.time_window,
+                        remaining_time=remaining_time
+                    )
+                    
+                    logger.info(f"群组 {group_id} 触发频率限制，剩余冷却时间: {remaining_time}秒")
+                    yield event.chain_result([Plain(error_message)])
+                    return
+                
+                # 未超过限制，执行原函数
+                logger.debug(f"群组 {group_id} 频率限制检查通过")
+                async for result in func(self, event):
+                    yield result
+                    
+            except Exception as e:
+                # 频率限制器出错，记录错误但不阻止请求（异常安全降级）
+                logger.error(f"频率限制检查时出错: {e}，允许请求继续")
+                async for result in func(self, event):
+                    yield result
+        
+        return wrapper
+    return decorator
+
 @register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.3")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
+        
+        # 保存完整配置，供装饰器使用
+        self.config = config
+        
         # 支持多个API密钥
         self.openrouter_api_keys = config.get("openrouter_api_keys", [])
         # 向后兼容：如果还在使用旧的单个API密钥配置
@@ -21,46 +214,26 @@ class MyPlugin(Star):
         
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
-
-
-    # sanitize_prompt 函数已注释掉，不再使用
-    # def sanitize_prompt(self, prompt: str) -> str:
-    #     """净化提示词，替换可能触发内容过滤器的敏感词汇"""
-    #     # 定义敏感词汇映射表
-    #     sensitive_words = {
-    #         # 材质相关
-    #         "树脂": "收藏级模型",
-    #         "肌肤": "表面质感",
-    #         "皮肤": "表面质感",
-    #         "肉体": "身体部位",
-    #         "裸露": "暴露",
-    #         "裸体": "未着装",
-    #         "性感": "吸引力",
-    #         "诱惑": "吸引",
-    #
-    #         # 其他可能触发过滤的词汇
-    #         "血": "红色液体",
-    #         "暴力": "激烈动作",
-    #         "恐怖": "惊悚",
-    #         "恶心": "不适",
-    #         "死亡": "消失",
-    #         "杀": "击败",
-    #         "死": "消失",
-    #
-    #         # 手办相关敏感词
-    #         "手办": "收藏模型",
-    #         "PVC": "塑料材质",
-    #         "涂装": "上色",
-    #         "可动": "活动关节",
-    #         "等身大": "真人比例",
-    #         "抱枕": "靠垫",
-    #     }
-    #
-    #     # 替换敏感词汇
-    #     for word, replacement in sensitive_words.items():
-    #         prompt = prompt.replace(word, replacement)
-    #
-    #     return prompt
+        
+        # 初始化频率限制器
+        self.rate_limiter = None
+        try:
+            if config.get("rate_limit_enabled", True):
+                max_requests = config.get("rate_limit_max_requests", 10)
+                time_window = config.get("rate_limit_time_window", 60)
+                cleanup_interval = config.get("rate_limit_cleanup_interval", 300)
+                
+                self.rate_limiter = RateLimiter(
+                    max_requests=max_requests,
+                    time_window=time_window,
+                    cleanup_interval=cleanup_interval
+                )
+                logger.info(f"频率限制器已初始化: {max_requests}次/{time_window}秒")
+            else:
+                logger.info("频率限制功能已禁用")
+        except Exception as e:
+            logger.error(f"初始化频率限制器失败: {e}")
+            self.rate_limiter = None
 
     @filter.command_group("aiimg", alias=["aiimg"])
     async def aiimg_group(self, event: AstrMessageEvent):
@@ -101,6 +274,7 @@ class MyPlugin(Star):
         
         yield event.chain_result([Plain(help_text)])
 
+    @rate_limited()
     @filter.command("aiimg生成", alias=["aiimg"])
     async def aiimg_generate(self, event: AstrMessageEvent):
         """生成图像或根据参考图片修改图像"""
@@ -194,6 +368,7 @@ class MyPlugin(Star):
             yield event.chain_result(error_chain)
             return
 
+    @rate_limited()
     @filter.command("aiimg手办化")
     async def aiimg_figure(self, event: AstrMessageEvent):
         """将图片转换为收藏模型"""
